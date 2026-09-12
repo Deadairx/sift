@@ -7,3 +7,7 @@ The first MVP goal is narrow:
 > Submit a Twitch VOD URL and eventually retrieve its transcript and AI-generated summary.
 
 Current project context and constraints live in `PROJECT_CONTEXT.md`.
+
+Deployment notes:
+
+- Deploy `sift-worker` to x86_64 Linux: `docs/sift-worker-package.md`
