@@ -1,12 +1,50 @@
+use axum::{Json, Router, http::StatusCode, routing::post};
+use sift::{JobStatus, SubmitJobRequest, SubmitJobResponse, error_response, generate_job_id};
+use std::net::SocketAddr;
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sift::init_tracing();
 
-    tracing::info!("sift-worker started");
-    tracing::info!("waiting for Ctrl-C to stop");
+    let addr = SocketAddr::from(([127, 0, 0, 1], 7387));
+    let app = Router::new().route("/jobs", post(submit_job));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    tokio::signal::ctrl_c().await?;
+    tracing::info!(%addr, "sift-worker started");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(%error, "failed to listen for shutdown signal");
+            }
+        })
+        .await?;
 
     tracing::info!("sift-worker stopping");
     Ok(())
+}
+
+async fn submit_job(
+    Json(request): Json<SubmitJobRequest>,
+) -> Result<(StatusCode, Json<SubmitJobResponse>), (StatusCode, Json<sift::ErrorResponse>)> {
+    if let Err(message) = sift::validate_twitch_vod_url(&request.url) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(error_response("invalid_url", message)),
+        ));
+    }
+
+    let id = generate_job_id();
+    let worker = std::env::var("SIFT_WORKER_ID").unwrap_or_else(|_| "local-worker".to_string());
+
+    tracing::info!(job_id = %id.0, url = %request.url, %worker, "accepted job submission");
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitJobResponse {
+            id,
+            status: JobStatus::Queued,
+            worker,
+        }),
+    ))
 }
