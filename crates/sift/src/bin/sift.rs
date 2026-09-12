@@ -4,6 +4,10 @@ use sift::{DEFAULT_WORKER_ENDPOINT, ErrorResponse, SubmitJobRequest, SubmitJobRe
 #[derive(Debug, Parser)]
 #[command(version, about = "Submit long-form content to Sift")]
 struct Cli {
+    /// Download the full VOD, even in debug builds.
+    #[arg(long)]
+    full_download: bool,
+
     /// URL to submit for processing.
     url: String,
 }
@@ -29,7 +33,10 @@ async fn run(cli: Cli) -> Result<(), String> {
 
     let response = reqwest::Client::new()
         .post(&endpoint)
-        .json(&SubmitJobRequest { url: cli.url })
+        .json(&SubmitJobRequest {
+            url: cli.url,
+            full_download: cli.full_download,
+        })
         .send()
         .await
         .map_err(|error| format!("could not reach worker at {worker}: {error}"))?;

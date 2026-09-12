@@ -36,8 +36,9 @@ async fn submit_job(
 
     let id = generate_job_id();
     let worker = std::env::var("SIFT_WORKER_ID").unwrap_or_else(|_| "local-worker".to_string());
+    let jobs_root = sift::jobs_dir_from_env();
     let metadata =
-        sift::persist_initial_job_state(sift::jobs_dir_from_env(), id, request.url, worker)
+        sift::persist_initial_job_state(&jobs_root, id, request.url, worker, request.full_download)
             .map_err(|message| {
                 tracing::error!(%message, "failed to persist accepted job state");
                 (
@@ -55,6 +56,27 @@ async fn submit_job(
         "job state transition"
     );
     tracing::info!(job_id = %metadata.id.0, url = %metadata.source_url, worker = %metadata.worker, state = %metadata.state.as_str(), "accepted job submission");
+
+    let ingestion_metadata = metadata.clone();
+    tokio::spawn(async move {
+        let job_id = ingestion_metadata.id.0.clone();
+        let url = ingestion_metadata.source_url.clone();
+        let worker = ingestion_metadata.worker.clone();
+
+        match sift::begin_twitch_ingestion(jobs_root, ingestion_metadata).await {
+            Ok(metadata) => tracing::info!(
+                job_id = %metadata.id.0,
+                url = %metadata.source_url,
+                worker = %metadata.worker,
+                to_state = %metadata.state.as_str(),
+                twitch_vod_id = metadata.twitch_vod_id.as_deref().unwrap_or(""),
+                "job completed initial Twitch media acquisition"
+            ),
+            Err(message) => {
+                tracing::error!(%job_id, %url, %worker, %message, "failed to begin Twitch ingestion")
+            }
+        }
+    });
 
     Ok((
         StatusCode::ACCEPTED,
