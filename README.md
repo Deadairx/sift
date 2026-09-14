@@ -11,3 +11,4 @@ Current project context and constraints live in `PROJECT_CONTEXT.md`.
 Deployment notes:
 
 - Deploy `sift-worker` to x86_64 Linux: `docs/sift-worker-package.md`
+- Install `sift-worker` with the MVP runtime layout: `docs/sift-worker-runtime-layout.md`

@@ -2,6 +2,8 @@
 
 Issue: #9
 
+Runtime layout decisions for the installed service live in `docs/sift-worker-runtime-layout.md`.
+
 ## Build the worker
 
 For the MVP, cross-build `sift-worker` from macOS with the Zig-backed Cargo path:
@@ -73,10 +75,10 @@ ssh cody@sift-01 'mkdir -p /tmp/sift-jobs && SIFT_WORKER_ID=sift-01 SIFT_JOBS_DI
 
 The worker listens on `127.0.0.1:7387` and accepts job submissions at `POST /jobs`.
 
-For a persistent host-local jobs directory later, use something like:
+For the persistent host-local jobs directory chosen for the MVP, use:
 
 ```sh
-SIFT_WORKER_ID=sift-01 SIFT_JOBS_DIR=/var/lib/sift/jobs /path/to/sift-worker
+SIFT_WORKER_ID=sift-01 SIFT_JOBS_DIR=/var/lib/sift/jobs /usr/local/bin/sift-worker
 ```
 
 ## Smoke test
