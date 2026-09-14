@@ -1,0 +1,17 @@
+[Unit]
+Description=Sift worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sift
+Group=sift
+EnvironmentFile=/etc/sift/sift-worker.env
+WorkingDirectory=/var/lib/sift
+ExecStart=/usr/local/bin/sift-worker
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

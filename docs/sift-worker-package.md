@@ -12,7 +12,7 @@ For the MVP, cross-build `sift-worker` from macOS with the Zig-backed Cargo path
 cargo zigbuild --release --bin sift-worker --target x86_64-unknown-linux-gnu
 ```
 
-This keeps packaging deliberately simple: no Dockerfile, package manager, systemd unit, CI release flow, or deployment tool yet. The command produces a Linux x86_64 binary that can be copied to a Sift node and run manually.
+This keeps packaging deliberately simple: no Dockerfile, package manager, CI release flow, or deployment tool yet. The command produces a Linux x86_64 binary that can be copied to a Sift node and installed under the runtime layout.
 
 A plain Cargo cross-build from macOS is not enough on this machine because dependencies such as `ring` require a Linux target C compiler and `x86_64-linux-gnu-gcc` is not installed.
 
@@ -73,12 +73,36 @@ Start the worker on `sift-01`:
 ssh cody@sift-01 'mkdir -p /tmp/sift-jobs && SIFT_WORKER_ID=sift-01 SIFT_JOBS_DIR=/tmp/sift-jobs /tmp/sift-worker'
 ```
 
-The worker listens on `127.0.0.1:7387` and accepts job submissions at `POST /jobs`.
+The worker listens on `127.0.0.1:7387` by default and accepts job submissions at `POST /jobs`.
 
 For the persistent host-local jobs directory chosen for the MVP, use:
 
 ```sh
 SIFT_WORKER_ID=sift-01 SIFT_JOBS_DIR=/var/lib/sift/jobs /usr/local/bin/sift-worker
+```
+
+For the installed service, set `SIFT_WORKER_LISTEN_ADDR=0.0.0.0:7387` in `/etc/sift/sift-worker.env` so the worker accepts LAN submissions.
+
+## Install as a systemd service
+
+Install the binary, service user, runtime directories, environment file, and unit on `sift-01`:
+
+```sh
+ssh cody@sift-01 'sudo useradd --system --home-dir /var/lib/sift --shell /usr/bin/nologin sift || true'
+ssh cody@sift-01 'sudo install -d -o sift -g sift -m 0750 /var/lib/sift/jobs && sudo install -d -o root -g root -m 0755 /etc/sift'
+scp target/x86_64-unknown-linux-gnu/release/sift-worker cody@sift-01:/tmp/sift-worker
+scp deploy/systemd/sift-worker.service cody@sift-01:/tmp/sift-worker.service
+ssh cody@sift-01 'sudo install -o root -g root -m 0755 /tmp/sift-worker /usr/local/bin/sift-worker'
+ssh cody@sift-01 'printf "%s\n" "SIFT_WORKER_ID=sift-01" "SIFT_JOBS_DIR=/var/lib/sift/jobs" "SIFT_WORKER_LISTEN_ADDR=0.0.0.0:7387" "SIFT_YT_DLP=/usr/bin/yt-dlp" | sudo tee /etc/sift/sift-worker.env >/dev/null'
+ssh cody@sift-01 'sudo install -o root -g root -m 0644 /tmp/sift-worker.service /etc/systemd/system/sift-worker.service'
+ssh cody@sift-01 'sudo systemctl daemon-reload && sudo systemctl enable --now sift-worker.service'
+```
+
+Verify the service and logs:
+
+```sh
+ssh cody@sift-01 'systemctl status sift-worker --no-pager'
+ssh cody@sift-01 'journalctl -u sift-worker --no-pager -n 50'
 ```
 
 ## Smoke test

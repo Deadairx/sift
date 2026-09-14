@@ -8,6 +8,7 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use url::Url;
 
 pub const DEFAULT_WORKER_ENDPOINT: &str = "http://127.0.0.1:7387";
+pub const DEFAULT_WORKER_LISTEN_ADDR: &str = "127.0.0.1:7387";
 pub const DEFAULT_JOBS_DIR: &str = "sift-jobs";
 pub const DEFAULT_MEDIA_DOWNLOAD_SECONDS: u64 = 30;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -126,6 +127,15 @@ pub fn jobs_dir_from_env() -> PathBuf {
     std::env::var_os("SIFT_JOBS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_JOBS_DIR))
+}
+
+pub fn worker_listen_addr_from_env() -> Result<std::net::SocketAddr, String> {
+    let value = std::env::var("SIFT_WORKER_LISTEN_ADDR")
+        .unwrap_or_else(|_| DEFAULT_WORKER_LISTEN_ADDR.to_string());
+
+    value
+        .parse()
+        .map_err(|error| format!("SIFT_WORKER_LISTEN_ADDR must be host:port: {error}"))
 }
 
 pub fn persist_initial_job_state(
@@ -497,6 +507,14 @@ mod tests {
             media_download_seconds(false).expect("mode should resolve"),
             expected
         );
+    }
+
+    #[test]
+    fn parses_worker_listen_addresses() {
+        let addr: std::net::SocketAddr =
+            "0.0.0.0:7387".parse().expect("listen address should parse");
+
+        assert_eq!(addr.to_string(), "0.0.0.0:7387");
     }
 
     #[test]

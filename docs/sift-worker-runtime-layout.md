@@ -59,6 +59,7 @@ The systemd install should provide at least:
 ```text
 SIFT_WORKER_ID=<node-name>
 SIFT_JOBS_DIR=/var/lib/sift/jobs
+SIFT_WORKER_LISTEN_ADDR=0.0.0.0:7387
 ```
 
 Optional environment values:
@@ -68,6 +69,8 @@ SIFT_YT_DLP=/usr/bin/yt-dlp
 ```
 
 If `SIFT_YT_DLP` is omitted, `sift-worker` expects `yt-dlp` to be available on `PATH`.
+
+`SIFT_WORKER_LISTEN_ADDR` defaults to `127.0.0.1:7387` for local development. Installed node services should set it to `0.0.0.0:7387` or a specific LAN interface address so the worker can accept submissions from the LAN.
 
 ## Directory Ownership
 

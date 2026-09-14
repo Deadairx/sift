@@ -1,12 +1,10 @@
 use axum::{Json, Router, http::StatusCode, routing::post};
 use sift::{SubmitJobRequest, SubmitJobResponse, error_response, generate_job_id};
-use std::net::SocketAddr;
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sift::init_tracing();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 7387));
+    let addr = sift::worker_listen_addr_from_env()?;
     let app = Router::new().route("/jobs", post(submit_job));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
