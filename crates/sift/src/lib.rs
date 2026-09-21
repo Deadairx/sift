@@ -11,6 +11,7 @@ pub const DEFAULT_WORKER_ENDPOINT: &str = "http://127.0.0.1:7387";
 pub const DEFAULT_WORKER_LISTEN_ADDR: &str = "127.0.0.1:7387";
 pub const DEFAULT_JOBS_DIR: &str = "sift-jobs";
 pub const DEFAULT_MEDIA_DOWNLOAD_SECONDS: u64 = 30;
+pub const DEFAULT_INGESTION_CONCURRENCY: usize = 1;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
@@ -61,6 +62,7 @@ pub struct ErrorBody {
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
     Accepted,
+    Waiting,
     Downloading,
     Downloaded,
 }
@@ -69,6 +71,7 @@ impl JobStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
+            Self::Waiting => "waiting",
             Self::Downloading => "downloading",
             Self::Downloaded => "downloaded",
         }
@@ -138,6 +141,26 @@ pub fn worker_listen_addr_from_env() -> Result<std::net::SocketAddr, String> {
         .map_err(|error| format!("SIFT_WORKER_LISTEN_ADDR must be host:port: {error}"))
 }
 
+pub fn ingestion_concurrency_from_env() -> Result<usize, String> {
+    let Some(value) = std::env::var_os("SIFT_INGESTION_CONCURRENCY") else {
+        return Ok(DEFAULT_INGESTION_CONCURRENCY);
+    };
+
+    parse_ingestion_concurrency(&value.to_string_lossy())
+}
+
+fn parse_ingestion_concurrency(value: &str) -> Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|error| format!("SIFT_INGESTION_CONCURRENCY must be an integer: {error}"))?;
+
+    if limit == 0 {
+        return Err("SIFT_INGESTION_CONCURRENCY must be at least 1".to_string());
+    }
+
+    Ok(limit)
+}
+
 pub fn persist_initial_job_state(
     jobs_root: impl AsRef<Path>,
     id: JobId,
@@ -174,6 +197,18 @@ pub fn persist_initial_job_state(
             state_path.display()
         )
     })?;
+
+    Ok(metadata)
+}
+
+pub fn transition_job_state(
+    jobs_root: impl AsRef<Path>,
+    mut metadata: JobMetadata,
+    state: JobStatus,
+) -> Result<JobMetadata, String> {
+    metadata.updated_at_ms = unix_timestamp_millis();
+    metadata.state = state;
+    write_job_state(&jobs_root.as_ref().join(&metadata.id.0), &metadata)?;
 
     Ok(metadata)
 }
@@ -453,7 +488,7 @@ mod tests {
     use super::{
         DEFAULT_MEDIA_DOWNLOAD_SECONDS, JobId, JobStatus, extract_twitch_vod,
         media_download_seconds, persist_initial_job_state, prepare_twitch_ingestion,
-        validate_twitch_vod_url,
+        transition_job_state, validate_twitch_vod_url,
     };
     use std::fs;
 
@@ -515,6 +550,22 @@ mod tests {
             "0.0.0.0:7387".parse().expect("listen address should parse");
 
         assert_eq!(addr.to_string(), "0.0.0.0:7387");
+    }
+
+    #[test]
+    fn parses_ingestion_concurrency_limit() {
+        assert_eq!(
+            super::parse_ingestion_concurrency("3").expect("limit should parse"),
+            3
+        );
+    }
+
+    #[test]
+    fn rejects_zero_ingestion_concurrency_limit() {
+        let error =
+            super::parse_ingestion_concurrency("0").expect_err("zero should not be a valid limit");
+
+        assert_eq!(error, "SIFT_INGESTION_CONCURRENCY must be at least 1");
     }
 
     #[test]
@@ -581,6 +632,33 @@ mod tests {
         assert!(artifact.contains("\"media_dir\": \"media\""));
         assert!(artifact.contains("\"twitch_vod_id\": \"123456789\""));
         assert!(media_dir.is_dir());
+
+        fs::remove_dir_all(&root).expect("test jobs directory should clean up");
+    }
+
+    #[test]
+    fn transitioning_job_state_updates_inspectable_json() {
+        let root =
+            std::env::temp_dir().join(format!("sift-test-transition-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+
+        let metadata = persist_initial_job_state(
+            &root,
+            JobId("job_transition".to_string()),
+            "https://www.twitch.tv/videos/123456789".to_string(),
+            "test-worker".to_string(),
+            false,
+        )
+        .expect("job state should persist");
+
+        let metadata = transition_job_state(&root, metadata, JobStatus::Waiting)
+            .expect("job state should transition");
+
+        let state_file = root.join("job_transition").join("state.json");
+        let state = fs::read_to_string(&state_file).expect("state file should be readable");
+
+        assert_eq!(metadata.state, JobStatus::Waiting);
+        assert!(state.contains("\"state\": \"waiting\""));
 
         fs::remove_dir_all(&root).expect("test jobs directory should clean up");
     }
