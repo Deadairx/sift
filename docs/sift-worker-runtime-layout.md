@@ -60,6 +60,7 @@ The systemd install should provide at least:
 SIFT_WORKER_ID=<node-name>
 SIFT_JOBS_DIR=/var/lib/sift/jobs
 SIFT_WORKER_LISTEN_ADDR=0.0.0.0:7387
+SIFT_INGESTION_CONCURRENCY=1
 ```
 
 Optional environment values:
@@ -71,6 +72,8 @@ SIFT_YT_DLP=/usr/bin/yt-dlp
 If `SIFT_YT_DLP` is omitted, `sift-worker` expects `yt-dlp` to be available on `PATH`.
 
 `SIFT_WORKER_LISTEN_ADDR` defaults to `127.0.0.1:7387` for local development. Installed node services should set it to `0.0.0.0:7387` or a specific LAN interface address so the worker can accept submissions from the LAN.
+
+`SIFT_INGESTION_CONCURRENCY` defaults to `1`. It limits how many ingestion jobs on this worker may own download capacity at the same time. Jobs that have been accepted but are waiting for capacity are persisted with `"state": "waiting"`; jobs that own capacity and are running the media download are persisted with `"state": "downloading"`.
 
 ## Directory Ownership
 
