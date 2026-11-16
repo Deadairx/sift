@@ -61,6 +61,7 @@ SIFT_WORKER_ID=<node-name>
 SIFT_JOBS_DIR=/var/lib/sift/jobs
 SIFT_WORKER_LISTEN_ADDR=0.0.0.0:7387
 SIFT_INGESTION_CONCURRENCY=1
+SIFT_INGESTION_QUEUE_CAPACITY=50
 ```
 
 Optional environment values:
@@ -74,6 +75,14 @@ If `SIFT_YT_DLP` is omitted, `sift-worker` expects `yt-dlp` to be available on `
 `SIFT_WORKER_LISTEN_ADDR` defaults to `127.0.0.1:7387` for local development. Installed node services should set it to `0.0.0.0:7387` or a specific LAN interface address so the worker can accept submissions from the LAN.
 
 `SIFT_INGESTION_CONCURRENCY` defaults to `1`. It limits how many ingestion jobs on this worker may own download capacity at the same time. Jobs that have been accepted but are waiting for capacity are persisted with `"state": "waiting"`; jobs that own capacity and are running the media download are persisted with `"state": "downloading"`.
+
+## Ingestion Queue and Backpressure
+
+The worker has a bounded in-memory waiting queue, defaulting to 50 jobs per worker. `SIFT_INGESTION_QUEUE_CAPACITY` must be at least 1. A single dispatcher waits for an available ingestion permit before removing the next job, so queued jobs are distinct from active downloads. `SIFT_INGESTION_CONCURRENCY` independently limits active ingestions (default 1; increase to 3 for a worker capable of three simultaneous downloads).
+
+The HTTP handler reserves queue capacity before persisting a job. A full or unavailable queue returns HTTP 503 with `Retry-After: 120` (seconds), without writing a job record. On acceptance the worker persists `waiting` state before enqueueing and responds HTTP 202. Retry-After is advisory and does not guarantee capacity when the client retries. The CLI does not yet automatically retry.
+
+**Durability boundary:** Queue entries are in memory; the existing per-job JSON is persistent, but this version does not replay it on startup. A crash can strand an accepted `waiting` or `downloading` job. Recovery is tracked in #25, while graceful draining and task ownership are tracked in #22 and #21. No durable delivery guarantee is made yet. A failed ingestion currently remains in `downloading` state; failure-state handling remains follow-up work.
 
 ## Directory Ownership
 
