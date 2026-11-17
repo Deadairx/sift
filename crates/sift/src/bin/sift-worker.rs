@@ -8,7 +8,7 @@ use axum::{
     routing::post,
 };
 use sift::{JobMetadata, SubmitJobRequest, SubmitJobResponse, error_response, generate_job_id};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::{sync::{Semaphore, mpsc}, task::JoinSet};
 
 #[derive(Clone)]
 struct WorkerState {
@@ -64,25 +64,61 @@ async fn dispatch_jobs(
     concurrency: usize,
 ) {
     let capacity = std::sync::Arc::new(Semaphore::new(concurrency));
+    let mut tasks: JoinSet<(String, Result<JobMetadata, String>)> = JoinSet::new();
+    let mut accepting = true;
     loop {
-        let permit = match capacity.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-        let Some(metadata) = receiver.recv().await else { break };
-        let root = jobs_root.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let job_id = metadata.id.0.clone();
-            match sift::begin_twitch_ingestion(root, metadata).await {
-                Ok(metadata) => tracing::info!(
-                    job_id = %metadata.id.0,
-                    state = %metadata.state.as_str(),
-                    "job completed initial Twitch media acquisition"
-                ),
-                Err(message) => tracing::error!(%job_id, %message, "ingestion failed"),
+        // Reap completions even when the concurrency limit is saturated.
+        tokio::select! {
+            completed = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(completed) = completed {
+                    observe_ingestion_completion(completed);
+                }
             }
-        });
+            permit = capacity.clone().acquire_owned(), if accepting => {
+                let Ok(permit) = permit else { break };
+                match receiver.recv().await {
+                    Some(metadata) => {
+                        let root = jobs_root.clone();
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            let job_id = metadata.id.0.clone();
+                            let result = sift::begin_twitch_ingestion(root, metadata).await;
+                            (job_id, result)
+                        });
+                    }
+                    None => accepting = false,
+                }
+            }
+        }
+        if !accepting && tasks.is_empty() {
+            break;
+        }
+    }
+    // The dispatcher owns all ingestion tasks. Draining on queue closure is
+    // intentional; signal-driven graceful shutdown is a separate concern (#22).
+    while let Some(completed) = tasks.join_next().await {
+        observe_ingestion_completion(completed);
+    }
+}
+
+fn observe_ingestion_completion(
+    completed: Result<(String, Result<JobMetadata, String>), tokio::task::JoinError>,
+) {
+    match completed {
+        Ok((_, Ok(metadata))) => tracing::info!(
+            job_id = %metadata.id.0,
+            state = %metadata.state.as_str(),
+            "job completed initial Twitch media acquisition"
+        ),
+        Ok((job_id, Err(message))) => {
+            tracing::error!(%job_id, %message, "ingestion failed");
+        }
+        Err(error) if error.is_panic() => {
+            tracing::error!(%error, "ingestion task panicked");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ingestion task cancelled");
+        }
     }
 }
 
