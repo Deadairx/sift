@@ -67,6 +67,6 @@ jobs:
           assert second[0]==202,second
           third=submit(1003)
           assert third[0]==503,third
-          assert third[1].get('Retry-After')=='120',third
+          assert {k.lower(): v for k, v in third[1].items()}.get('retry-after')=='120',third
           print('PASS: active=202, waiting=202, overloaded=503 with Retry-After 120')
           PY
