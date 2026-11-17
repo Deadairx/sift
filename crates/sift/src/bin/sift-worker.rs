@@ -67,17 +67,20 @@ async fn dispatch_jobs(
     let mut tasks: JoinSet<(String, Result<JobMetadata, String>)> = JoinSet::new();
     let mut accepting = true;
     loop {
-        // Reap completions even when the concurrency limit is saturated.
+        // Never dequeue while all execution slots are occupied. JoinSet
+        // ownership lets us observe completions and free those slots.
         tokio::select! {
             completed = tasks.join_next(), if !tasks.is_empty() => {
                 if let Some(completed) = completed {
                     observe_ingestion_completion(completed);
                 }
             }
-            permit = capacity.clone().acquire_owned(), if accepting => {
-                let Ok(permit) = permit else { break };
-                match receiver.recv().await {
+            next = receiver.recv(), if accepting && tasks.len() < concurrency => {
+                match next {
                     Some(metadata) => {
+                        // The task owns the permit until ingestion finishes.
+                        let permit = capacity.clone().acquire_owned().await
+                            .expect("ingestion semaphore remains open");
                         let root = jobs_root.clone();
                         tasks.spawn(async move {
                             let _permit = permit;
