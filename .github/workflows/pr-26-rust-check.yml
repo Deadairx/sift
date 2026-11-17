@@ -22,3 +22,51 @@ jobs:
         run: cargo test --workspace --locked
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  backpressure-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build worker
+        run: cargo build --locked --bin sift-worker
+      - name: Exercise HTTP backpressure with a blocked downloader
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sift-smoke
+          cat > /tmp/sift-smoke/downloader <<'EOF'
+          #!/bin/sh
+          sleep 8
+          exit 1
+          EOF
+          chmod +x /tmp/sift-smoke/downloader
+          SIFT_INGESTION_CONCURRENCY=1 SIFT_INGESTION_QUEUE_CAPACITY=1 SIFT_JOBS_DIR=/tmp/sift-smoke/jobs SIFT_YT_DLP=/tmp/sift-smoke/downloader target/debug/sift-worker > /tmp/sift-smoke/worker.log 2>&1 &
+          worker_pid=$!
+          trap 'kill "$worker_pid" 2>/dev/null || true; cat /tmp/sift-smoke/worker.log' EXIT
+          python3 - <<'PY'
+          import json,time,urllib.request,urllib.error
+          url='http://127.0.0.1:7387/jobs'
+          def submit(i):
+              req=urllib.request.Request(url,data=json.dumps({'url':f'https://www.twitch.tv/videos/{i}','full_download':False}).encode(),headers={'Content-Type':'application/json'})
+              try:
+                  with urllib.request.urlopen(req,timeout=5) as r:return r.status,dict(r.headers)
+              except urllib.error.HTTPError as e:return e.code,dict(e.headers)
+          for _ in range(100):
+              try:
+                  import socket
+                  with socket.create_connection(('127.0.0.1',7387),timeout=.1):break
+              except OSError:time.sleep(.1)
+          else:raise RuntimeError('worker did not start')
+          first=submit(1001)
+          assert first[0]==202,first
+          time.sleep(1)
+          second=submit(1002)
+          assert second[0]==202,second
+          third=submit(1003)
+          assert third[0]==503,third
+          assert third[1].get('Retry-After')=='120',third
+          print('PASS: active=202, waiting=202, overloaded=503 with Retry-After 120')
+          PY
