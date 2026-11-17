@@ -12,6 +12,7 @@ pub const DEFAULT_WORKER_LISTEN_ADDR: &str = "127.0.0.1:7387";
 pub const DEFAULT_JOBS_DIR: &str = "sift-jobs";
 pub const DEFAULT_MEDIA_DOWNLOAD_SECONDS: u64 = 30;
 pub const DEFAULT_INGESTION_CONCURRENCY: usize = 1;
+pub const DEFAULT_INGESTION_QUEUE_CAPACITY: usize = 50;
 static JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
@@ -159,6 +160,22 @@ fn parse_ingestion_concurrency(value: &str) -> Result<usize, String> {
     }
 
     Ok(limit)
+}
+
+pub fn ingestion_queue_capacity_from_env() -> Result<usize, String> {
+    let Some(value) = std::env::var_os("SIFT_INGESTION_QUEUE_CAPACITY") else {
+        return Ok(DEFAULT_INGESTION_QUEUE_CAPACITY);
+    };
+    parse_ingestion_queue_capacity(&value.to_string_lossy())
+}
+
+fn parse_ingestion_queue_capacity(value: &str) -> Result<usize, String> {
+    let capacity = value.parse::<usize>()
+        .map_err(|error| format!("SIFT_INGESTION_QUEUE_CAPACITY must be an integer: {error}"))?;
+    if capacity == 0 {
+        return Err("SIFT_INGESTION_QUEUE_CAPACITY must be at least 1".to_string());
+    }
+    Ok(capacity)
 }
 
 pub fn persist_initial_job_state(
@@ -566,6 +583,13 @@ mod tests {
             super::parse_ingestion_concurrency("0").expect_err("zero should not be a valid limit");
 
         assert_eq!(error, "SIFT_INGESTION_CONCURRENCY must be at least 1");
+    }
+
+    #[test]
+    fn parses_and_validates_ingestion_queue_capacity() {
+        assert_eq!(super::parse_ingestion_queue_capacity("50").unwrap(), 50);
+        assert!(super::parse_ingestion_queue_capacity("0").is_err());
+        assert!(super::parse_ingestion_queue_capacity("not-a-number").is_err());
     }
 
     #[test]

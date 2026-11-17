@@ -1,15 +1,20 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
-use sift::{SubmitJobRequest, SubmitJobResponse, error_response, generate_job_id};
-use tokio::sync::Semaphore;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use sift::{JobMetadata, SubmitJobRequest, SubmitJobResponse, error_response, generate_job_id};
+use tokio::sync::{Semaphore, mpsc};
 
 #[derive(Clone)]
 struct WorkerState {
     jobs_root: PathBuf,
     worker: String,
-    ingestion_capacity: Arc<Semaphore>,
-    ingestion_concurrency_limit: usize,
+    queue: mpsc::Sender<JobMetadata>,
 }
 
 #[tokio::main]
@@ -17,20 +22,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sift::init_tracing();
 
     let ingestion_concurrency_limit = sift::ingestion_concurrency_from_env()?;
+    let queue_capacity = sift::ingestion_queue_capacity_from_env()?;
+    let (queue, receiver) = mpsc::channel(queue_capacity);
     let state = WorkerState {
         jobs_root: sift::jobs_dir_from_env(),
         worker: std::env::var("SIFT_WORKER_ID").unwrap_or_else(|_| "local-worker".to_string()),
-        ingestion_capacity: Arc::new(Semaphore::new(ingestion_concurrency_limit)),
-        ingestion_concurrency_limit,
+        queue,
     };
+    tokio::spawn(dispatch_jobs(
+        receiver,
+        state.jobs_root.clone(),
+        ingestion_concurrency_limit,
+    ));
 
     let addr = sift::worker_listen_addr_from_env()?;
     let app = Router::new()
         .route("/jobs", post(submit_job))
-        .with_state(state.clone());
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
-    tracing::info!(%addr, ingestion_concurrency_limit = state.ingestion_concurrency_limit, "sift-worker started");
+    tracing::info!(%addr, ingestion_concurrency_limit, queue_capacity, "sift-worker started");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
@@ -40,138 +51,166 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .await?;
 
+    // Task ownership and graceful draining are tracked in #21 and #22.
     tracing::info!("sift-worker stopping");
     Ok(())
+}
+
+/// One dispatcher owns dequeueing. It waits for an execution slot BEFORE
+/// removing a job from the queue, so queue capacity means waiting jobs.
+async fn dispatch_jobs(
+    mut receiver: mpsc::Receiver<JobMetadata>,
+    jobs_root: PathBuf,
+    concurrency: usize,
+) {
+    let capacity = std::sync::Arc::new(Semaphore::new(concurrency));
+    loop {
+        let permit = match capacity.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let Some(metadata) = receiver.recv().await else { break };
+        let root = jobs_root.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let job_id = metadata.id.0.clone();
+            match sift::begin_twitch_ingestion(root, metadata).await {
+                Ok(metadata) => tracing::info!(
+                    job_id = %metadata.id.0,
+                    state = %metadata.state.as_str(),
+                    "job completed initial Twitch media acquisition"
+                ),
+                Err(message) => tracing::error!(%job_id, %message, "ingestion failed"),
+            }
+        });
+    }
 }
 
 async fn submit_job(
     State(state): State<WorkerState>,
     Json(request): Json<SubmitJobRequest>,
-) -> Result<(StatusCode, Json<SubmitJobResponse>), (StatusCode, Json<sift::ErrorResponse>)> {
+) -> Response {
     if let Err(message) = sift::validate_twitch_vod_url(&request.url) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(error_response("invalid_url", message)),
-        ));
+        return (StatusCode::BAD_REQUEST, Json(error_response("invalid_url", message)))
+            .into_response();
     }
 
-    let id = generate_job_id();
-    let worker = state.worker.clone();
-    let jobs_root = state.jobs_root.clone();
-    let metadata =
-        sift::persist_initial_job_state(&jobs_root, id, request.url, worker, request.full_download)
-            .map_err(|message| {
-                tracing::error!(%message, "failed to persist accepted job state");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(error_response("state_persistence_failed", message)),
-                )
-            })?;
-
-    tracing::info!(
-        job_id = %metadata.id.0,
-        url = %metadata.source_url,
-        worker = %metadata.worker,
-        from_state = "new",
-        to_state = %metadata.state.as_str(),
-        "job state transition"
-    );
-    tracing::info!(job_id = %metadata.id.0, url = %metadata.source_url, worker = %metadata.worker, state = %metadata.state.as_str(), "accepted job submission");
-
-    let ingestion_metadata = metadata.clone();
-    tokio::spawn(async move {
-        let job_id = ingestion_metadata.id.0.clone();
-        let url = ingestion_metadata.source_url.clone();
-        let worker = ingestion_metadata.worker.clone();
-
-        let ingestion_metadata = match sift::transition_job_state(
-            &jobs_root,
-            ingestion_metadata,
-            sift::JobStatus::Waiting,
-        ) {
-            Ok(metadata) => metadata,
-            Err(message) => {
-                tracing::error!(%job_id, %url, %worker, %message, "failed to persist waiting job state");
-                return;
-            }
-        };
-
-        tracing::info!(
-            job_id = %job_id,
-            url = %url,
-            worker = %worker,
-            from_state = "accepted",
-            to_state = %ingestion_metadata.state.as_str(),
-            "job state transition"
-        );
-        tracing::info!(
-            job_id = %job_id,
-            concurrency_limit = state.ingestion_concurrency_limit,
-            available_permits = state.ingestion_capacity.available_permits(),
-            "job waiting for ingestion capacity"
-        );
-
-        // Hold the permit for the ingestion work; dropping it releases capacity.
-        // `let _ = ...` would drop the permit immediately.
-        let _permit = match state.ingestion_capacity.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::error!(%job_id, %url, %worker, "ingestion capacity semaphore closed");
-                return;
-            }
-        };
-
-        tracing::info!(
-            job_id = %job_id,
-            concurrency_limit = state.ingestion_concurrency_limit,
-            available_permits = state.ingestion_capacity.available_permits(),
-            "job acquired ingestion capacity"
-        );
-
-        match sift::begin_twitch_ingestion(jobs_root, ingestion_metadata).await {
-            Ok(metadata) => tracing::info!(
-                job_id = %metadata.id.0,
-                url = %metadata.source_url,
-                worker = %metadata.worker,
-                to_state = %metadata.state.as_str(),
-                twitch_vod_id = metadata.twitch_vod_id.as_deref().unwrap_or(""),
-                "job completed initial Twitch media acquisition"
-            ),
-            Err(message) => {
-                tracing::error!(%job_id, %url, %worker, %message, "failed to begin Twitch ingestion")
-            }
+    // Reserve capacity before writing anything. A full queue causes no
+    // accepted job record and no unbounded task creation.
+    let permit = match state.queue.try_reserve() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "120")],
+                Json(error_response("queue_full", "ingestion queue is full; retry later")),
+            ).into_response();
         }
-    });
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "120")],
+                Json(error_response("worker_unavailable", "ingestion dispatcher is unavailable")),
+            ).into_response();
+        }
+    };
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SubmitJobResponse {
-            id: metadata.id,
-            status: metadata.state,
-            worker: metadata.worker,
-        }),
-    ))
+    let metadata = match sift::persist_initial_job_state(
+        &state.jobs_root,
+        generate_job_id(),
+        request.url,
+        state.worker.clone(),
+        request.full_download,
+    ) {
+        Ok(metadata) => metadata,
+        Err(message) => {
+            tracing::error!(%message, "failed to persist accepted job state");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_response("state_persistence_failed", message)),
+            ).into_response();
+        }
+    };
+    let metadata = match sift::transition_job_state(
+        &state.jobs_root,
+        metadata,
+        sift::JobStatus::Waiting,
+    ) {
+        Ok(metadata) => metadata,
+        Err(message) => {
+            tracing::error!(%message, "failed to persist waiting job state");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(error_response("state_persistence_failed", message)),
+            ).into_response();
+        }
+    };
+
+    tracing::info!(job_id = %metadata.id.0, "accepted queued ingestion job");
+    let response = SubmitJobResponse {
+        id: metadata.id.clone(),
+        status: metadata.state.clone(),
+        worker: metadata.worker.clone(),
+    };
+    permit.send(metadata);
+    (StatusCode::ACCEPTED, Json(response)).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use tokio::sync::Semaphore;
+    use super::*;
+    use std::fs;
 
     #[tokio::test]
-    async fn semaphore_capacity_is_not_available_beyond_limit() {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("first permit should be available");
+    async fn queue_rejects_at_capacity_and_recovers_after_dequeue() {
+        let (sender, mut receiver) = mpsc::channel::<u32>(2);
+        sender.try_send(1).unwrap();
+        sender.try_send(2).unwrap();
+        assert!(matches!(sender.try_send(3), Err(mpsc::error::TrySendError::Full(3))));
+        assert_eq!(receiver.recv().await, Some(1));
+        sender.try_send(3).unwrap();
+        assert_eq!(receiver.recv().await, Some(2));
+        assert_eq!(receiver.recv().await, Some(3));
+    }
 
-        assert!(semaphore.clone().try_acquire_owned().is_err());
+    #[tokio::test]
+    async fn full_queue_returns_503_without_persisting_job() {
+        let root = std::env::temp_dir().join(format!("sift-queue-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (sender, _receiver) = mpsc::channel(1);
+        sender.try_send(JobMetadata {
+            id: sift::JobId("existing".into()),
+            source_url: "https://www.twitch.tv/videos/123".into(),
+            twitch_vod_id: None,
+            worker: "test".into(),
+            full_download: false,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            state: sift::JobStatus::Waiting,
+        }).unwrap();
+        let response = submit_job(
+            State(WorkerState { jobs_root: root.clone(), worker: "test".into(), queue: sender }),
+            Json(SubmitJobRequest { url: "https://www.twitch.tv/videos/456".into(), full_download: false }),
+        ).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "120");
+        assert!(!root.exists());
+    }
 
-        drop(permit);
-
-        assert!(semaphore.try_acquire_owned().is_ok());
+    #[tokio::test]
+    async fn accepted_job_is_persisted_as_waiting_and_enqueued() {
+        let root = std::env::temp_dir().join(format!("sift-accepted-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (sender, mut receiver) = mpsc::channel(1);
+        let response = submit_job(
+            State(WorkerState { jobs_root: root.clone(), worker: "test".into(), queue: sender }),
+            Json(SubmitJobRequest { url: "https://www.twitch.tv/videos/456".into(), full_download: false }),
+        ).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let job = receiver.recv().await.unwrap();
+        assert_eq!(job.state, sift::JobStatus::Waiting);
+        let persisted = fs::read_to_string(root.join(&job.id.0).join("state.json")).unwrap();
+        assert!(persisted.contains("\"state\": \"waiting\""));
+        fs::remove_dir_all(root).unwrap();
     }
 }
