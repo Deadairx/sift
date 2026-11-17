@@ -1,0 +1,27 @@
+name: PR 21 Rust verification
+
+on:
+  push:
+    branches:
+      - issue-21-own-ingestion-tasks
+  pull_request:
+    branches:
+      - issue-20-bounded-ingestion-queue
+
+permissions:
+  contents: read
+
+jobs:
+  rust-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
